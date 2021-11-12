@@ -30,6 +30,7 @@ import numpy as np
 from functools import partial
 import pyopencl as cl
 import pyopencl.tools as cl_tools
+from pytools.obj_array import make_obj_array
 
 from meshmode.array_context import (
     PyOpenCLArrayContext,
@@ -49,6 +50,7 @@ from mirgecom.simutil import (
 from mirgecom.io import make_init_message
 
 from mirgecom.integrators import rk4_step
+from mirgecom.fluid import make_conserved
 from mirgecom.steppers import advance_state
 from mirgecom.boundary import IsothermalNoSlipBoundary
 from mirgecom.initializers import (Uniform)
@@ -62,7 +64,8 @@ from mirgecom.logging_quantities import (
     logmgr_add_many_discretization_quantities,
     logmgr_add_device_name,
     logmgr_add_device_memory_usage,
-    set_sim_state
+    set_sim_state,
+    LogUserQuantity
 )
 
 logger = logging.getLogger(__name__)
@@ -72,6 +75,147 @@ class MyRuntimeError(RuntimeError):
     """Simple exception to kill the simulation."""
 
     pass
+
+class UniformModified:
+    r"""Solution initializer for a uniform flow with boundary layer smoothing.
+
+    Similar to the Uniform initializer, except the velocity profile is modified
+    so that the velocity goes to zero at y(min, max)
+
+    The smoothing comes from a hyperbolic tangent with weight sigma
+
+    .. automethod:: __init__
+    .. automethod:: __call__
+    """
+
+    def __init__(
+            self, *, dim=1, nspecies=0, pressure=1.0, temperature=2.5,
+            velocity=None, mass_fracs=None,
+            temp_wall, temp_sigma,
+            xmin=0., xmax=1.0,
+            ymin=0., ymax=1.0
+    ):
+        r"""Initialize uniform flow parameters.
+
+        Parameters
+        ----------
+        dim: int
+            specify the number of dimensions for the flow
+        nspecies: int
+            specify the number of species in the flow
+        temperature: float
+            specifies the temperature
+        pressure: float
+            specifies the pressure
+        velocity: numpy.ndarray
+            specifies the flow velocity
+        temp_wall: float
+            wall temperature
+        temp_sigma: float
+            near-wall temperature relaxation parameter
+        vel_sigma: float
+            near-wall velocity relaxation parameter
+        xmin: flaot
+            minimum y-coordinate for smoothing
+        xmax: float
+            maximum y-coordinate for smoothing
+        ymin: flaot
+            minimum y-coordinate for smoothing
+        ymax: float
+            maximum y-coordinate for smoothing
+        """
+        if velocity is not None:
+            numvel = len(velocity)
+            myvel = velocity
+            if numvel > dim:
+                dim = numvel
+            elif numvel < dim:
+                myvel = np.zeros(shape=(dim,))
+                for i in range(numvel):
+                    myvel[i] = velocity[i]
+            self._velocity = myvel
+        else:
+            self._velocity = np.zeros(shape=(dim,))
+
+        if mass_fracs is not None:
+            self._nspecies = len(mass_fracs)
+            self._mass_fracs = mass_fracs
+        else:
+            self._nspecies = nspecies
+            self._mass_fracs = np.zeros(shape=(nspecies,))
+
+        if self._velocity.shape != (dim,):
+            raise ValueError(f"Expected {dim}-dimensional inputs.")
+
+        self._pressure = pressure
+        self._temperature = temperature
+        self._dim = dim
+        self._temp_wall = temp_wall
+        self._temp_sigma = temp_sigma
+        self._xmin = xmin
+        self._xmax = xmax
+        self._ymin = ymin
+        self._ymax = ymax
+
+    def __call__(self, x_vec, *, eos, **kwargs):
+        """
+        Create a uniform flow solution at locations *x_vec*.
+
+        Parameters
+        ----------
+        x_vec: numpy.ndarray
+            Nodal coordinates
+        eos: :class:`mirgecom.eos.IdealSingleGas`
+            Equation of state class with method to supply gas *gamma*.
+        """
+
+        xpos = x_vec[0]
+        ypos = x_vec[1]
+        actx = ypos.array_context
+        xmax = 0.0*x_vec[1] + self._xmax
+        xmin = 0.0*x_vec[1] + self._xmin
+        ymax = 0.0*x_vec[1] + self._ymax
+        ymin = 0.0*x_vec[1] + self._ymin
+        ones = (1.0 + x_vec[0]) - x_vec[0]
+
+        pressure = self._pressure * ones
+        temperature = self._temperature * ones
+
+        # modify the temperature in the near wall region to match
+        # the isothermal boundaries
+        sigma = self._temp_sigma
+        wall_temperature = self._temp_wall
+        smoothing_min_x = actx.np.tanh(sigma*(actx.np.abs(xpos-xmin)))
+        smoothing_max_x = actx.np.tanh(sigma*(actx.np.abs(xpos-xmax)))
+        smoothing_min_y = actx.np.tanh(sigma*(actx.np.abs(ypos-ymin)))
+        smoothing_max_y = actx.np.tanh(sigma*(actx.np.abs(ypos-ymax)))
+        temperature = (wall_temperature +
+                       (temperature - wall_temperature)*
+                       smoothing_min_x*smoothing_max_x*
+                       smoothing_min_y*smoothing_max_y)
+
+        velocity = make_obj_array([self._velocity[i] * ones
+                                   for i in range(self._dim)])
+        y = make_obj_array([self._mass_fracs[i] * ones
+                            for i in range(self._nspecies)])
+        if self._nspecies:
+            mass = eos.get_density(pressure, temperature, y)
+        else:
+            mass = pressure/temperature/eos.gas_const()
+        specmass = mass * y
+
+        mom = mass*velocity
+        if self._nspecies:
+            internal_energy = eos.get_internal_energy(temperature=temperature,
+                                                      species_mass=specmass)
+        else:
+            internal_energy = pressure/(eos.gamma() - 1)
+        kinetic_energy = 0.5 * np.dot(mom, mom)/mass
+        energy = internal_energy + kinetic_energy
+
+        return make_conserved(dim=self._dim, mass=mass, energy=energy,
+                              momentum=mom, species_mass=specmass)
+
 
 
 @mpi_entry_point
@@ -113,7 +257,7 @@ def main(ctx_factory=cl.create_some_context, use_logmgr=True,
     else:
         timestepper = rk4_step
 
-    t_final = 1e-5
+    t_final = 1e-4
     current_cfl = 1.0
     current_dt = 1e-6
     current_t = 0
@@ -121,14 +265,21 @@ def main(ctx_factory=cl.create_some_context, use_logmgr=True,
 
     # some i/o frequencies
     nstatus = 1
-    nrestart = 5
-    nviz = 1
+    nrestart = 100
+    nviz = 10
     nhealth = 1
 
     health_pres_min = 1.0
-    health_pres_max = 1e6
+    health_pres_max = 1e7
+
+    alpha_sc = 0
+    s0_sc = 5.0
+    kappa_sc = 0.5
 
     dim = 2
+    viz_path = "viz_data/"
+    vizname = viz_path + casename
+
     rst_path = "restart_data/"
     rst_pattern = (
         rst_path + "{cname}-{step:04d}-{rank:04d}.pkl"
@@ -152,13 +303,14 @@ def main(ctx_factory=cl.create_some_context, use_logmgr=True,
                                                                     generate_mesh)
         local_nelements = local_mesh.nelements
 
-    order = 1
+    order = 2
     discr = EagerDGDiscretization(
         actx, local_mesh, order=order, mpi_communicator=comm
     )
     nodes = thaw(actx, discr.nodes())
 
     vis_timer = None
+    log_cfl = LogUserQuantity(name="cfl", value=current_cfl)
 
     if logmgr:
         logmgr_add_device_name(logmgr, queue)
@@ -168,10 +320,12 @@ def main(ctx_factory=cl.create_some_context, use_logmgr=True,
 
         vis_timer = IntervalTimer("t_vis", "Time spent visualizing")
         logmgr.add_quantity(vis_timer)
+        logmgr.add_quantity(log_cfl, interval=nstatus)
 
         logmgr.add_watches([
             ("step.max", "step = {value}, "),
-            ("t_sim.max", "sim time: {value:1.6e} s\n"),
+            ("t_sim.max", "sim time: {value:1.6e} s, "),
+            ("cfl.max", ", cfl = {value:1.4f}\n"),
             ("min_pressure", "------- P (min, max) (Pa) = ({value:1.9e}, "),
             ("max_pressure",    "{value:1.9e})\n"),
             ("t_step.max", "------- step walltime: {value:6g} s, "),
@@ -179,18 +333,32 @@ def main(ctx_factory=cl.create_some_context, use_logmgr=True,
         ])
 
     mu = 1.e-5
-    kappa = 1.225*mu/0.75
+    rho = 2.0
+    #kappa = rho*mu/0.75
+    kappa = 100000
     transport_model = SimpleTransport(viscosity=mu, thermal_conductivity=kappa)
     gamma = 1.4
-    gas_constant = 287.0
+    gas_constant = 500.0
+    pressure = 1e6
+    temperature = pressure/gas_constant/rho
+    wall_temp = 300.0
+    temp_sigma = 10
     eos = IdealSingleGas(gamma=gamma, gas_const=gas_constant, transport_model=transport_model)
 
     vel = np.zeros(shape=(dim,))
     orig = np.zeros(shape=(dim,))
-    initializer = Uniform(dim=dim, rho=1.225, p=1e5)
-    wall = IsothermalNoSlipBoundary()
+
+    xmin=-0.5
+    xmax=0.5
+    ymin=-0.5
+    ymax=0.5
+
+    initializer = UniformModified(dim=dim, pressure=pressure, temperature=temperature,
+                                  temp_wall=wall_temp, temp_sigma=temp_sigma,
+                                  xmin=xmin, xmax=xmax, ymin=ymin, ymax=ymax)
+    wall = IsothermalNoSlipBoundary(wall_temperature=wall_temp)
     boundaries = {BTAG_ALL: wall}
-    uniform_state = initializer(nodes)
+    uniform_state = initializer(x_vec=nodes, eos=eos)
 
     if rst_filename:
         current_t = restart_data["t"]
@@ -217,13 +385,13 @@ def main(ctx_factory=cl.create_some_context, use_logmgr=True,
     if rank == 0:
         logger.info(init_message)
 
-    def my_write_viz(step, t, state, dv=None):
+    def my_write_viz(step, t, state, dv=None, ts_field=None):
         if dv is None:
             dv = eos.dependent_vars(state)
         viz_fields = [("cv", state),
                       ("dv", dv)]
         from mirgecom.simutil import write_visfile
-        write_visfile(discr, viz_fields, visualizer, vizname=casename,
+        write_visfile(discr, viz_fields, visualizer, vizname=vizname,
                       step=step, t=t, overwrite=True, vis_timer=vis_timer)
 
     def my_write_restart(step, t, state):
@@ -254,12 +422,91 @@ def main(ctx_factory=cl.create_some_context, use_logmgr=True,
 
         return health_error
 
+    def my_get_viscous_timestep(discr, eos, cv):
+        """Routine returns the the node-local maximum stable viscous timestep.
+
+        Parameters
+        ----------
+        discr: grudge.eager.EagerDGDiscretization
+            the discretization to use
+        eos: :class:`~mirgecom.eos.GasEOS`
+            A gas equation of state
+        cv: :class:`~mirgecom.fluid.ConservedVars`
+            Fluid solution
+
+        Returns
+        -------
+        :class:`~meshmode.dof_array.DOFArray`
+            The maximum stable timestep at each node.
+        """
+        from grudge.dt_utils import characteristic_lengthscales
+        from mirgecom.fluid import compute_wavespeed
+
+        length_scales = characteristic_lengthscales(cv.array_context, discr)
+
+        mu = 0
+        d_alpha_max = 0
+        transport = eos.transport_model()
+        if transport:
+            from mirgecom.viscous import get_local_max_species_diffusivity
+            mu = transport.viscosity(eos, cv)
+            d_alpha_max = \
+                get_local_max_species_diffusivity(
+                    cv.array_context, discr,
+                    transport.species_diffusivity(eos, cv)
+                )
+
+        return(
+            length_scales / (compute_wavespeed(eos, cv)
+            + ((mu + d_alpha_max + alpha_sc) / length_scales))
+        )
+
+    def my_get_viscous_cfl(discr, eos, dt, cv):
+        """Calculate and return node-local CFL based on current state and timestep.
+
+        Parameters
+        ----------
+        discr: :class:`grudge.eager.EagerDGDiscretization`
+            the discretization to use
+        eos: :class:`~mirgecom.eos.GasEOS`
+            A gas equation of state
+        dt: float or :class:`~meshmode.dof_array.DOFArray`
+            A constant scalar dt or node-local dt
+        cv: :class:`~mirgecom.fluid.ConservedVars`
+            The fluid conserved variables
+
+        Returns
+        -------
+        :class:`~meshmode.dof_array.DOFArray`
+            The CFL at each node.
+        """
+        return dt / my_get_viscous_timestep(discr, eos=eos, cv=cv)
+
+    def my_get_timestep(t, dt, state):
+        t_remaining = max(0, t_final - t)
+        if constant_cfl:
+            ts_field = current_cfl * my_get_viscous_timestep(discr, eos=eos,
+                                                             cv=state)
+            from grudge.op import nodal_min
+            dt = actx.to_numpy(nodal_min(discr, "vol", ts_field))
+            cfl = current_cfl
+        else:
+            ts_field = my_get_viscous_cfl(discr, eos=eos, dt=dt,
+                                          cv=state)
+            from grudge.op import nodal_max
+            cfl = actx.to_numpy(nodal_max(discr, "vol", ts_field))
+
+        return ts_field, cfl, min(t_remaining, dt)
+
     def my_pre_step(step, t, dt, state):
         try:
             dv = None
 
             if logmgr:
                 logmgr.tick_before()
+
+            ts_field, cfl, dt = my_get_timestep(t, dt, state)
+            log_cfl.set_quantity(cfl)
 
             from mirgecom.simutil import check_step
             do_viz = check_step(step=step, interval=nviz)
@@ -318,7 +565,9 @@ def main(ctx_factory=cl.create_some_context, use_logmgr=True,
     if rank == 0:
         logger.info("Checkpointing final state ...")
     final_dv = eos.dependent_vars(current_state)
-    my_write_viz(step=current_step, t=current_t, state=current_state, dv=final_dv)
+    ts_field, cfl, dt = my_get_timestep(t=current_t, dt=current_dt, state=current_state)
+    my_write_viz(step=current_step, t=current_t, state=current_state, dv=final_dv,
+                 ts_field=ts_field)
     my_write_restart(step=current_step, t=current_t, state=current_state)
 
     if logmgr:
@@ -332,7 +581,7 @@ def main(ctx_factory=cl.create_some_context, use_logmgr=True,
 
 if __name__ == "__main__":
     import argparse
-    casename = "pulse"
+    casename = "hotbox"
     parser = argparse.ArgumentParser(description=f"MIRGE-Com Example: {casename}")
     parser.add_argument("--lazy", action="store_true",
         help="switch to a lazy computation mode")
