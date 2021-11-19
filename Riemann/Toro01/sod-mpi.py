@@ -42,6 +42,7 @@ from grudge.shortcuts import make_visualizer
 
 
 from mirgecom.euler import euler_operator
+from mirgecom.artificial_viscosity import av_operator, smoothness_indicator
 from mirgecom.fluid import make_conserved
 from mirgecom.simutil import (
     get_sim_timestep,
@@ -53,7 +54,7 @@ from mirgecom.mpi import mpi_entry_point
 from mirgecom.integrators import rk4_step, euler_step
 from mirgecom.steppers import advance_state
 from mirgecom.boundary import PrescribedInviscidBoundary
-from mirgecom.initializers import SodShock1D
+from mirgecom.initializers import SodShock1D, PlanarDiscontinuity
 from mirgecom.eos import IdealSingleGas
 
 from logpyle import IntervalTimer, set_dt
@@ -122,12 +123,13 @@ class RiemannExact:
 
         self._dim = dim
         self._x0 = x0
-        #self._rhol = rhol
-        #self._pl = pl
-        #self._ul = ul
-        #self._rhor = rhor
-        #self._pr = pr
-        #self._ur = ur
+        self._rhol = rhol
+        self._pl = pl
+        self._ul = ul
+        self._rhor = rhor
+        self._pr = pr
+        self._ur = ur
+        self._gamma = gamma
         stateL = [rhol, ul, pl]
         stateR = [rhor, ur, pr]
 
@@ -158,24 +160,37 @@ class RiemannExact:
         zeros = 0*xpos
         x0 = zeros + self._x0
 
-        if time < 1e-9:
-            s = xpos - x0
-        else:
+        gm1 = self._gamma - 1.0
+        gmn1 = 1.0/gm1
+        rhor = zeros + self._rhor
+        rhol = zeros + self._rhol
+        ur = zeros + self._ur
+        ul = zeros + self._ul
+        x0 = zeros + self._x0
+        energyl = zeros + gmn1 * self._pl/self._rhol
+        energyr = zeros + gmn1 * self._pr/self._rhor
+        yesno = actx.np.greater(xpos, x0)
+        mass = actx.np.where(yesno, rhor, rhol)
+        velocity = make_obj_array(actx.np.where(yesno, ur, ul))
+        energy = actx.np.where(yesno, energyr, energyl)
+
+        if time > 1e-9:
             s = (xpos - x0)/time
 
-        actx = xpos.array_context
-        s_flat = to_numpy(flatten(s, actx), actx)
+            actx = xpos.array_context
+            s_flat = to_numpy(flatten(s, actx), actx)
 
-        dens, pres, velx, eint, scpd = self._rp.sample(s_flat)
+            dens, pres, velx, eint, scpd = self._rp.sample(s_flat)
 
-        rho = unflatten(xpos, from_numpy(np.array(dens), actx), actx)
-        u = make_obj_array([unflatten(xpos, from_numpy(np.array(velx), actx), actx)])
-        e = unflatten(xpos, from_numpy(np.array(eint), actx), actx)
+            mass = unflatten(xpos, from_numpy(np.array(dens), actx), actx)
+            velocity = make_obj_array([unflatten(xpos, from_numpy(np.array(velx), actx), actx)])
+            energy = unflatten(xpos, from_numpy(np.array(eint), actx), actx)
 
-        return make_conserved(dim=self._dim, mass=rho,
-                              momentum=rho*u,
-                              energy=rho*(e + 0.5*np.dot(u, u))
-                             )
+        momentum = mass*velocity
+        energy = mass*(energy + 0.5*np.dot(velocity, velocity))
+
+        return make_conserved(dim=self._dim, mass=mass, momentum=momentum,
+                              energy=energy)
 
 
 @mpi_entry_point
@@ -220,16 +235,17 @@ def main(ctx_factory=cl.create_some_context, use_logmgr=True,
     t_final = 0.2
     #t_final = 0.001
     current_cfl = 1.0
-    current_dt = .0001
+    current_dt = .0002
     current_t = 0
+    #current_t = 0.1
     constant_cfl = False
     current_step = 0
 
     # some i/o frequencies
-    nstatus = 100
+    nstatus = 1
     nrestart = 500
     nviz = 10
-    nhealth = 10
+    nhealth = 1
 
     health_pres_min = 0.0
     health_pres_max = 10
@@ -255,8 +271,8 @@ def main(ctx_factory=cl.create_some_context, use_logmgr=True,
         #nel_1d = 2501
         #nel_1d = 251
         #nel_1d = 20
-        nel_1d = 500
-        #nel_1d = 500
+        #nel_1d = 100
+        nel_1d = 501
         #nel_1d = 1000
         box_ll = 0.0
         box_ur = 1.0
@@ -266,7 +282,15 @@ def main(ctx_factory=cl.create_some_context, use_logmgr=True,
                                                                     generate_mesh)
         local_nelements = local_mesh.nelements
 
+    # discretization and model control
     order = 1
+    alpha_sc = 0. # no artificial dissipation
+    #alpha_sc = 0.0001 # this is minimum amount to resolve the entropy jump in the rarefaction
+    #alpha_sc = 0.001 # this amount resolved the wiggles at the shock front
+    s0_sc = -5.0
+    kappa_sc = 0.5
+    s0_sc = np.log10(1.0e-4 / np.power(order, 4))
+
     discr = EagerDGDiscretization(
         actx, local_mesh, order=order, mpi_communicator=comm
     )
@@ -297,11 +321,37 @@ def main(ctx_factory=cl.create_some_context, use_logmgr=True,
 
     # first problem from Toro, modified Sod shock
     gamma = 1.4
-    r=300
-    initializer = SodShock1D(dim=dim, x0=0.3, rhol=1.0, rhor=0.125,
-                             pleft=1.0, pright=0.1, ul=0.75, ur=0.0)
-    exact_solution = RiemannExact(dim=dim, x0=0.3, gamma=gamma, rhol=1.0, rhor=0.125,
-                                  pl=1.0, pr=0.1, ul=0.75, ur=0.0)
+    r = 300
+    # first problem from Toro, modified Sod shock
+    gamma = 1.4
+    r = 300
+    rhol = 1.0
+    rhor = 0.125
+    pl = 1.0
+    pr = 0.1
+    ul = 0.75
+    ur = 0.0
+    tl = pl/rhol/r
+    tr = pr/rhor/r
+    x0 = 0.3
+    init_sigma = 1e-3
+    initializer = SodShock1D(dim=dim, x0=x0, rhol=rhol, rhor=rhor,
+                             pleft=pl, pright=pr, ul=ul, ur=ur)
+    exact_solution = RiemannExact(dim=dim, x0=x0, gamma=gamma,
+                                  rhol=rhol, rhor=rhor,
+                                  pl=pl, pr=pr,
+                                  ul=ul, ur=ur)
+    vel_left = np.zeros(shape=(dim, ))
+    vel_left[0]=ul
+    vel_right = np.zeros(shape=(dim, ))
+    vel_right[0]=ur
+    initializer = PlanarDiscontinuity(dim=dim, normal_dir=0, disc_location=0.3,
+                                      pressure_left=pl, pressure_right=pr,
+                                      temperature_left=tl, temperature_right=tr,
+                                      velocity_left=vel_left, velocity_right=vel_right,
+                                      sigma=init_sigma)
+    #initializer_riemann = RiemannExact(dim=dim, x0=0.3, gamma=gamma, rhol=1.0, rhor=0.125,
+                                       #pl=1.0, pr=0.1, ul=0.75, ur=0.0)
     eos = IdealSingleGas(gamma=gamma, gas_const=r)
     boundaries = {
         BTAG_ALL: PrescribedInviscidBoundary(fluid_solution_func=initializer)
@@ -310,12 +360,13 @@ def main(ctx_factory=cl.create_some_context, use_logmgr=True,
         current_t = restart_data["t"]
         current_step = restart_data["step"]
         current_state = restart_data["state"]
-        if logmgr:
-            from mirgecom.logging_quantities import logmgr_set_time
-            logmgr_set_time(logmgr, current_step, current_t)
     else:
         # Set the current state from time 0
-        current_state = initializer(nodes)
+        current_state = initializer(x_vec=nodes, eos=eos)
+
+    if logmgr:
+        from mirgecom.logging_quantities import logmgr_set_time
+        logmgr_set_time(logmgr, current_step, current_t)
 
     visualizer = make_visualizer(discr)
 
@@ -341,6 +392,8 @@ def main(ctx_factory=cl.create_some_context, use_logmgr=True,
     def my_write_viz(step, t, state, dv=None, exact=None, resid=None, ts_field=None):
         if dv is None:
             dv = eos.dependent_vars(state)
+        tagged_cells = smoothness_indicator(discr, state.mass, s0=s0_sc,
+                                            kappa=kappa_sc)
         if exact is None:
             exact = initializer(x_vec=nodes, eos=eos, time=t)
         dv_exact = eos.dependent_vars(exact)
@@ -352,6 +405,7 @@ def main(ctx_factory=cl.create_some_context, use_logmgr=True,
                       ("dv", dv),
                       ("velocity", state.velocity),
                       ("internal_energy", internal_energy),
+                      ("tagged_cells", tagged_cells),
                       ("exact", exact),
                       ("dv_exact", dv_exact),
                       ("velocity_exact", exact.velocity),
@@ -487,8 +541,14 @@ def main(ctx_factory=cl.create_some_context, use_logmgr=True,
         return state, dt
 
     def my_rhs(t, state):
-        return euler_operator(discr, cv=state, time=t,
-                              boundaries=boundaries, eos=eos)
+        return (
+            euler_operator(discr, cv=state, time=t, boundaries=boundaries, eos=eos)
+            + make_conserved(
+                dim, q=av_operator(discr, q=state.join(), boundaries=boundaries,
+                                   boundary_kwargs={"time": t, "eos": eos},
+                                   alpha=alpha_sc, s0=s0_sc, kappa=kappa_sc)
+            )
+        )
 
     current_dt = get_sim_timestep(discr, current_state, current_t, current_dt,
                                   current_cfl, eos, t_final, constant_cfl)
@@ -504,10 +564,11 @@ def main(ctx_factory=cl.create_some_context, use_logmgr=True,
         logger.info("Checkpointing final state ...")
 
     final_dv = eos.dependent_vars(current_state)
-    final_exact = initializer(x_vec=nodes, eos=eos, time=current_t)
+    final_exact = exact_solution(x_vec=nodes, eos=eos, time=current_t)
     final_resid = current_state - final_exact
     my_write_viz(step=current_step, t=current_t, state=current_state, dv=final_dv,
                  exact=final_exact, resid=final_resid)
+    #my_write_viz(step=current_step, t=current_t, state=current_state, dv=final_dv)
     my_write_restart(step=current_step, t=current_t, state=current_state)
 
     if logmgr:
