@@ -1,0 +1,10 @@
+emirge
+*.*vtu*
+*.sqlite*
+*.pkl
+runError*
+runOutput*
+*.pvsm
+viz_data
+restart_data
+__pycache__
