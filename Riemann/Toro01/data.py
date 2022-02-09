@@ -24,9 +24,11 @@ health_pres_max = 10
 nel_x = 200
 dim = 1
 order = 1
-#alpha_sc = 0. # no artificial dissipation
+#flux_fun = 0  # rusanov numerical flux
+flux_fun = 1  # hll numerical flux
+alpha_sc = 0. # no artificial dissipation
 #alpha_sc = 0.0001 # stabilize higher order
-alpha_sc = 0.0001 # this is minimum amount to resolve the entropy jump in the rarefaction
+#alpha_sc = 0.0001 # this is minimum amount to resolve the entropy jump in the rarefaction
 #alpha_sc = 0.001 # this amount resolved the wiggles at the shock front
 s0_sc = -5.0
 kappa_sc = 0.5
@@ -37,7 +39,6 @@ kappa_sc = 0.5
 
 # first problem from Toro, modified Sod shock
 init_type = 0 # for planar discontinuity
-init_sigma = 1e-2
 #init_type = 1 # for riemann exact solution
 gamma = 1.4
 r = 300

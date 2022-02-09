@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # default branch for building mirgecom for this driver
-mirge_branch="y1-production"
+mirge_branch="production"
 # conda environment name
 conda_env="mirgeDriver.devel"
 
